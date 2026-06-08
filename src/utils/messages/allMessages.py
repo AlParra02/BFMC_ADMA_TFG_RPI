@@ -194,24 +194,24 @@ class RequestSteerLimits(Enum):
     msgType = "bool"
 
 
-################################# From Nucleo ##################################
+################################# From VESC (replaces Nucleo) ##################################
 class BatteryLvl(Enum):
     Queue = "General"
     Owner = "threadRead"
     msgID = 1
-    msgType = "int"
+    msgType = "int"          # voltage in mV (mapped from VESC v_in float)
 
 class ImuData(Enum):
     Queue = "General"
     Owner = "threadRead"
     msgID = 2
-    msgType = "str"
+    msgType = "str"          # kept for dashboard compatibility; JSON-encoded roll/pitch/yaw
 
 class InstantConsumption(Enum):
     Queue = "General"
     Owner = "threadRead"
     msgID = 3
-    msgType = "float"
+    msgType = "float"        # current_input from VESC GetValues, in amps
 
 class ResourceMonitor(Enum):
     Queue = "General"
@@ -223,20 +223,20 @@ class CurrentSpeed(Enum):
     Queue = "General"
     Owner = "threadRead"
     msgID = 5
-    msgType = "float"
+    msgType = "float"        # converted from VESC rpm using wheel radius + motor poles
 
 class CurrentSteer(Enum):
     Queue = "General"
     Owner = "threadRead"
     msgID = 6
-    msgType = "float"
+    msgType = "float"        # echoed back from last SetServoPosition command
 
 class ImuAck(Enum):
     Queue = "General"
     Owner = "threadRead"
     msgID = 7
-    msgType = "str"
-    
+    msgType = "str"          # kept for state machine compatibility
+
 class ShutDownSignal(Enum):
     Queue = "General"
     Owner = "threadRead"
@@ -266,6 +266,36 @@ class SteeringLimits(Enum):
     Owner = "threadRead"
     msgID = 12
     msgType = "dict"
+
+class VescImuData(Enum):
+    Queue = "General"
+    Owner = "threadRead"
+    msgID = 13
+    msgType = "dict"
+    # Published dict format:
+    # {
+    #   "roll":  float,   # degrees
+    #   "pitch": float,   # degrees
+    #   "yaw":   float,   # degrees
+    #   "accel": [float, float, float],   # ax, ay, az  (m/s²)
+    #   "gyro":  [float, float, float],   # gx, gy, gz  (rad/s)
+    #   "quat":  [float, float, float, float]  # q0, q1, q2, q3
+    # }
+
+class VescTelemetry(Enum):
+    Queue = "General"
+    Owner = "threadRead"
+    msgID = 14
+    msgType = "dict"
+    # Published dict format:
+    # {
+    #   "rpm":          float,
+    #   "duty_cycle":   float,   # 0.0..1.0
+    #   "voltage":      float,   # volts
+    #   "current_motor":float,   # amps
+    #   "tachometer":   int,     # relative odometry ticks
+    #   "tachometer_abs": int    # absolute odometry ticks
+    # }
 
 
 ################################# From Locsys ##################################

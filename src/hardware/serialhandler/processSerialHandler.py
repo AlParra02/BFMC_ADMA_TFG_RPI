@@ -45,190 +45,317 @@ from src.utils.messages.messageHandlerSender import messageHandlerSender
 from src.statemachine.systemMode import SystemMode
 from src.utils.messages.allMessages import StateChange, SerialConnectionState
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Serial port detection pattern
+# ──────────────────────────────────────────────────────────────────────────────
+# The original Nucleo always appeared on ttyACM*.
+# A VESC connected over USB also appears on ttyACM*, but one connected via a
+# USB-to-UART adapter (e.g. CP2102 / CH340) appears on ttyUSB*.
+# Both patterns are covered here; the first matching port wins.
+_VESC_PORT_PATTERN = re.compile(r"/dev/tty(ACM|USB)\d+")
+
+
 class processSerialHandler(WorkerProcess):
-    """This process handle connection between NUCLEO and Raspberry PI.\n
+    """Manages the serial connection between the Raspberry Pi and the VESC.
+
+    Replaces the previous Nucleo-oriented version.  All structural logic
+    (reconnection, thread lifecycle, state-machine integration) is unchanged.
+    The following VESC-specific shared state attributes are added so that
+    threadWrite and threadRead can exchange data without an extra queue
+    round-trip:
+
+    Attributes added for VESC:
+        lastSteerAngle (float): Last steering angle in degrees commanded by
+            threadWrite._send_servo().  Read by threadRead to publish
+            CurrentSteer without a dedicated echo packet (the VESC does not
+            report servo position in GetValues).
+
+        batteryEnabled (bool): When True, threadRead publishes BatteryLvl
+            messages derived from v_in.  Toggled by threadWrite in response
+            to ToggleBatteryLvl queue messages.
+
+        instantEnabled (bool): When True, threadRead publishes
+            InstantConsumption messages derived from current_in.  Toggled by
+            threadWrite in response to ToggleInstant queue messages.
+
+        resourceMonitorEnabled (bool): When True, threadRead may publish
+            ResourceMonitor messages.  Toggled by threadWrite in response to
+            ToggleResourceMonitor queue messages.  Note: the VESC does not
+            supply heap/stack data; this flag is kept for interface
+            compatibility and may be used to gate CPU/memory stats collected
+            locally on the Raspberry Pi instead.
+
     Args:
-        queueList (dictionar of multiprocessing.queues.Queue): Dictionar of queues where the ID is the type of messages.
-        logging (logging object): Made for debugging.
-        debugging (bool, optional): A flag for debugging. Defaults to False.
-        example (bool, optional): A flag for running the example. Defaults to False.
+        queueList (dict): Dictionary of multiprocessing.Queue objects keyed
+            by priority string ("Critical", "Warning", "General", "Config").
+        logging (logging.Logger): Logger instance for debugging output.
+        ready_event (threading.Event, optional): Signalled when the process
+            is ready.  Defaults to None.
+        dashboard_ready (threading.Event, optional): Waited on before
+            sending the initial SerialConnectionState notification.
+        debugging (bool): Enables verbose per-message logging.
+        example (bool): Activates the built-in steering/speed sweep demo.
     """
 
     # ===================================== INIT =========================================
-    def __init__(self, queueList, logging, ready_event=None, dashboard_ready=None, debugging=False, example=False):
-        # devFile = "/dev/ttyACM0"
+
+    def __init__(self, queueList, logging, ready_event=None, dashboard_ready=None,
+                 debugging=False, example=False):
+
         logFile = "temp/serial_history.log"
 
-        self.logger = logging
-        self.queuesList = queueList
-        self.debugging = debugging
-        self.example = example
+        self.logger          = logging
+        self.queuesList      = queueList
+        self.debugging       = debugging
+        self.example         = example
         self.dashboard_ready = dashboard_ready
 
-        # comm init
-        self.serialCon = None
+        # ── Serial connection state ───────────────────────────────────────────
+        self.serialCon       = None
         self.serialConnected = False
-        self.serialDevice = None
-        self.serialLock = Lock()
-        self.reconnecting = False
+        self.serialDevice    = None
+        self.serialLock      = Lock()
+        self.reconnecting    = False
 
+        # ── VESC shared state (read by threadRead, written by threadWrite) ────
+        # Threading note: these are plain Python bools/floats.  They are only
+        # written by one thread (threadWrite) and read by another (threadRead).
+        # CPython's GIL makes individual reads/writes of simple types atomic,
+        # so no additional lock is needed here.
+
+        self.lastSteerAngle          = 0.0    # degrees; updated by threadWrite._send_servo()
+        self.batteryEnabled          = True   # gated by ToggleBatteryLvl
+        self.instantEnabled          = True   # gated by ToggleInstant
+        self.resourceMonitorEnabled  = False  # gated by ToggleResourceMonitor
+
+        # ── Supporting objects ────────────────────────────────────────────────
         self._init_subscribers()
         self._init_senders()
 
-        # log file init
         self.historyFile = FileHandler(logFile)
 
         super(processSerialHandler, self).__init__(self.queuesList, ready_event)
 
+    # ─────────────────────────────── subscribers / senders ──────────────────────
+
     def _init_subscribers(self):
-        self.stateChangeSubscriber = messageHandlerSubscriber(self.queuesList, StateChange, "lastOnly", True)
-        self.serialConnectionStateSubscriber = messageHandlerSubscriber(self.queuesList, SerialConnectionState, "lastOnly", True)
+        self.stateChangeSubscriber = messageHandlerSubscriber(
+            self.queuesList, StateChange, "lastOnly", True)
+        self.serialConnectionStateSubscriber = messageHandlerSubscriber(
+            self.queuesList, SerialConnectionState, "lastOnly", True)
 
     def _init_senders(self):
-        self.serialConnectedSender = messageHandlerSender(self.queuesList, SerialConnectionState)
+        self.serialConnectedSender = messageHandlerSender(
+            self.queuesList, SerialConnectionState)
+
+    # ─────────────────────────────── serial helpers ─────────────────────────────
 
     def _safe_close_serial(self):
         """Safely close the serial connection with proper error handling."""
-        if self.serialCon and hasattr(self.serialCon, 'is_open') and self.serialCon.is_open:
+        if self.serialCon and hasattr(self.serialCon, "is_open") and self.serialCon.is_open:
             try:
                 self.serialCon.close()
             except (OSError, serial.SerialException) as e:
-                print(f"\033[1;97m[ Serial Handler ] :\033[0m \033[1;93mWARNING\033[0m - Error closing serial connection: {e}")
+                print(
+                    f"\033[1;97m[ Serial Handler ] :\033[0m "
+                    f"\033[1;93mWARNING\033[0m - Error closing serial connection: {e}"
+                )
             except Exception as e:
-                print(f"\033[1;97m[ Serial Handler ] :\033[0m \033[1;91mERROR\033[0m - Unexpected error closing serial: {e}")
+                print(
+                    f"\033[1;97m[ Serial Handler ] :\033[0m "
+                    f"\033[1;91mERROR\033[0m - Unexpected error closing serial: {e}"
+                )
+
+    def _find_vesc_port(self):
+        """Return the first serial port that matches the VESC port pattern.
+
+        Checks ttyACM* (USB CDC, most common for VESC over USB) and ttyUSB*
+        (USB-to-UART adapters).  Returns None if no matching port is found.
+
+        Returns:
+            str | None: Device path such as '/dev/ttyACM0', or None.
+        """
+        for port in serial.tools.list_ports.comports():
+            if _VESC_PORT_PATTERN.match(port.device):
+                return port.device
+        return None
 
     def _try_serial_connection(self):
-        """Try to connect to the serial device."""
+        """Attempt to open a serial connection to the VESC.
+
+        Uses 115200 baud (match the baud rate configured in VESC Tool under
+        App → UART).  The input/output buffers are flushed after opening so
+        no stale bytes from a previous session are processed.
+
+        Sets self.serialConnected = True on success, False on failure.
+        """
         with self.serialLock:
             try:
-                # clean up existing connection safely
                 self._safe_close_serial()
 
-                self.serialDevice = next((port.device for port in serial.tools.list_ports.comports() if re.match(r"/dev/ttyACM\d+", port.device)), None)
-                self.serialCon = serial.Serial(self.serialDevice, 115200, timeout=0.1)
+                device = self._find_vesc_port()
+                if device is None:
+                    raise FileNotFoundError("No VESC serial port found")
+
+                self.serialDevice = device
+                self.serialCon    = serial.Serial(
+                    self.serialDevice,
+                    baudrate=115200,   # must match VESC Tool App → UART baud rate
+                    timeout=0.1,
+                )
                 self.serialCon.reset_input_buffer()
                 self.serialCon.reset_output_buffer()
                 self.serialConnected = True
-                print(f"\033[1;97m[ Serial Handler ] :\033[0m \033[1;92mINFO\033[0m - Connected to \033[94m{self.serialDevice}\033[0m")
+                print(
+                    f"\033[1;97m[ Serial Handler ] :\033[0m "
+                    f"\033[1;92mINFO\033[0m - Connected to VESC on "
+                    f"\033[94m{self.serialDevice}\033[0m"
+                )
 
-            except (serial.SerialException, FileNotFoundError):
+            except (serial.SerialException, FileNotFoundError) as e:
+                print(
+                    f"\033[1;97m[ Serial Handler ] :\033[0m "
+                    f"\033[1;93mWARNING\033[0m - Could not connect to VESC: {e}"
+                )
                 self._safe_close_serial()
-                self.serialCon = None
+                self.serialCon       = None
                 self.serialConnected = False
 
     def _try_reconnect(self):
-        """Try to reconnect to serial device (called by timer)."""
+        """Attempt to reconnect; reschedules itself every second until success."""
         if self.reconnecting:
-            return # another reconnection attempt is already in progress
+            return  # another attempt already in progress
 
         self.reconnecting = True
-
         self._try_serial_connection()
 
         if self.serialConnected:
-            # reset thread error states after successful reconnection
             self.serialConnectedSender.send(True)
             self._reset_thread_error_states()
             self.resume_threads()
             self.reconnecting = False
         else:
-            # schedule next attempt
             self.reconnecting = False
             threading.Timer(1, self._try_reconnect).start()
 
     def _reset_thread_error_states(self):
-        """Reset error states in threads after successful reconnection."""
+        """Clear per-thread error timestamps after a successful reconnection."""
         if self.threads:
             for thread in self.threads:
-                if hasattr(thread, 'last_error_time'):
+                if hasattr(thread, "last_error_time"):
                     thread.last_error_time = None
 
     def _wait_for_dashboard_and_notify(self):
-        """Wait for dashboard to be ready, then notify connected state once without blocking init."""
+        """Block until dashboard_ready is set, then send initial connection state."""
         self.dashboard_ready.wait()
         if self.dashboard_ready.is_set():
             self.serialConnectedSender.send(self.serialConnected)
 
-
     def _handle_serial_disconnection(self):
-        """Handle serial disconnection by pausing threads and starting reconnection."""
-
+        """Pause threads and schedule reconnection after a disconnection event."""
         with self.serialLock:
-            # check if already handling disconnection
             if self.reconnecting or not self.serialConnected:
-                return
+                return  # already handling it
 
-            print(f"\033[1;97m[ Serial Handler ] :\033[0m \033[1;93mWARNING\033[0m - Serial device disconnected")
+            print(
+                f"\033[1;97m[ Serial Handler ] :\033[0m "
+                f"\033[1;93mWARNING\033[0m - VESC serial device disconnected"
+            )
 
-            # mark as disconnected
             self.serialConnected = False
-
-            # clean up serial connection safely
             self._safe_close_serial()
-
             self.serialCon = None
 
             if self.threads:
                 self.pause_threads()
 
-            threading.Timer(1, self._try_reconnect).start()
+        threading.Timer(1, self._try_reconnect).start()
 
     # ===================================== RUN ==========================================
+
     def run(self):
-        """Apply the initializing methods and start the threads."""
+        """Connect to the VESC, notify the dashboard, and start the threads."""
         self._try_serial_connection()
 
         if not self.serialConnected:
-            print(f"\033[1;97m[ Serial Handler ] :\033[0m \033[1;93mWARNING\033[0m - No serial connection found")
+            print(
+                f"\033[1;97m[ Serial Handler ] :\033[0m "
+                f"\033[1;93mWARNING\033[0m - No VESC found at startup — "
+                f"will keep retrying"
+            )
             threading.Timer(1, self._try_reconnect).start()
 
         if self.dashboard_ready is not None:
             if self.dashboard_ready.is_set():
                 self.serialConnectedSender.send(self.serialConnected)
             else:
-                threading.Thread(target=self._wait_for_dashboard_and_notify, daemon=True).start()
+                threading.Thread(
+                    target=self._wait_for_dashboard_and_notify, daemon=True
+                ).start()
 
         super(processSerialHandler, self).run()
         self.historyFile.close()
 
-    # ===================================== PROCESS WORK ==========================================
+    # ===================================== PROCESS WORK =================================
+
     def process_work(self):
-        serialConnectionStateMessage = self.serialConnectionStateSubscriber.receive()
-        if serialConnectionStateMessage is False:
+        """Check for serial disconnection events published by the threads."""
+        msg = self.serialConnectionStateSubscriber.receive()
+        if msg is False:
             self._handle_serial_disconnection()
 
-    # ================================ STATE CHANGE HANDLER ========================================
+    # ================================ STATE CHANGE HANDLER ==============================
+
     def state_change_handler(self):
+        """React to system state-machine transitions."""
         message = self.stateChangeSubscriber.receive()
         if message is not None:
-            modeDict = SystemMode[message].value["serial_handler"]["process"]
-
-            if modeDict["enabled"] == True:
-                # only resume if serial is connected
+            mode_dict = SystemMode[message].value["serial_handler"]["process"]
+            if mode_dict["enabled"] is True:
                 if self.serialConnected:
                     self.resume_threads()
-
-            elif modeDict["enabled"] == False:
+            elif mode_dict["enabled"] is False:
                 self.pause_threads()
 
     # ===================================== STOP ==========================================
+
     def stop(self):
-        """Close the history file and stop the process."""
-        # close serial connection
+        """Zero the VESC outputs, close serial, and stop all threads."""
+        # Best-effort safe stop: send duty=0 directly before threads terminate.
+        # This guards against the car rolling away if the process is killed
+        # while the engine is enabled.
         with self.serialLock:
+            if self.serialCon and self.serialConnected and self.serialCon.is_open:
+                try:
+                    import pyvesc
+                    self.serialCon.write(pyvesc.encode(pyvesc.SetDutyCycle(0.0)))
+                    self.serialCon.write(pyvesc.encode(pyvesc.SetCurrentBrake(0.0)))
+                except Exception:
+                    pass  # best-effort only — don't block shutdown
+
             if self.serialCon:
                 try:
                     self.serialCon.close()
                 except Exception as e:
-                    print(f"\033[1;97m[ Serial Handler ] :\033[0m \033[1;93mWARNING\033[0m - Error closing serial port: {e}")
+                    print(
+                        f"\033[1;97m[ Serial Handler ] :\033[0m "
+                        f"\033[1;93mWARNING\033[0m - Error closing serial port: {e}"
+                    )
 
         super(processSerialHandler, self).stop()
 
-    # ===================================== INIT TH =================================
+    # ===================================== INIT THREADS =================================
+
     def _init_threads(self):
-        """Initializes the read and the write thread."""
-        readTh = threadRead(self, self.historyFile, self.queuesList, self.logger, self.debugging)
-        writeTh = threadWrite(self, self.historyFile, self.queuesList, self.logger, self.debugging, self.example)
+        """Initialise threadRead and threadWrite with the shared process reference."""
+        readTh  = threadRead(
+            self, self.historyFile, self.queuesList, self.logger, self.debugging
+        )
+        writeTh = threadWrite(
+            self, self.historyFile, self.queuesList, self.logger,
+            self.debugging, self.example
+        )
         self.threads.extend([readTh, writeTh])
 
         if not self.serialConnected:
@@ -240,23 +367,19 @@ class processSerialHandler(WorkerProcess):
 #                  in terminal:    python3 processSerialHandler.py
 
 if __name__ == "__main__":
-    from multiprocessing import Queue, Pipe
+    from multiprocessing import Queue
     import logging
     import time
 
-    allProcesses = list()
-    debugg = False
-    # We have a list of multiprocessing.Queue() which individualy represent a priority for processes.
     queueList = {
         "Critical": Queue(),
-        "Warning": Queue(),
-        "General": Queue(),
-        "Config": Queue(),
+        "Warning":  Queue(),
+        "General":  Queue(),
+        "Config":   Queue(),
     }
-    logger = logging.getLogger()
-    pipeRecv, pipeSend = Pipe(duplex=False)
-    process = processSerialHandler(queueList, logger, debugg, True)
+    logger  = logging.getLogger()
+    process = processSerialHandler(queueList, logger, example=True)
     process.daemon = True
     process.start()
-    time.sleep(4)  # modify the value to increase/decrease the time of the example
+    time.sleep(4)
     process.stop()
