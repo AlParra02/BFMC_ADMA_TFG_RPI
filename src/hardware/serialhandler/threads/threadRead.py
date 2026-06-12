@@ -26,6 +26,8 @@ from datetime import datetime, timedelta
 
 import pyvesc
 
+from src.hardware.serialhandler.threads.vesc_imu import GetImuData
+
 from src.templates.threadwithstop import ThreadWithStop
 from src.utils.messages.allMessages import (
     AliveSignal,
@@ -72,7 +74,6 @@ BATTERY_VOLTAGE_EMPTY = BATTERY_CELLS * CELL_VOLTAGE_EMPTY  # 9.0 V
 
 # VESC binary protocol constants
 COMM_GET_IMU_DATA = 65     # packet ID for IMU response
-COMM_FW_VERSION   = 0      # packet ID for firmware-version response (alive)
 VESC_FRAME_START  = 0x02   # short-frame start byte
 VESC_FRAME_END    = 0x03   # frame stop byte
 
@@ -354,10 +355,6 @@ class threadRead(ThreadWithStop):
             # COMM_GET_IMU_DATA — inertial measurement unit
             self._handle_imu_data(payload)
 
-        elif cmd_id == COMM_FW_VERSION:
-            # COMM_FW_VERSION — response to alive ping sent by threadWrite
-            self._handle_fw_version(payload)
-
         else:
             if self.debugger:
                 self.logger.info(
@@ -439,6 +436,13 @@ class threadRead(ThreadWithStop):
             if getattr(self.process, "instantEnabled", True):
                 self.instantConsumptionSender.send(telemetry["current_in"])
 
+            # ── Alive confirmation ─────────────────────────────────────────────
+            # GetValues is now also used as the alive ping (threadWrite has no
+            # dedicated firmware-version getter available in this pyvesc build).
+            # Any successfully decoded GetValues response confirms the link is up.
+            self.aliveSignalSender.send(True)
+            self.serialConnectionStateSender.send(True)
+
         except Exception as e:
             print(
                 f"\033[1;97m[ Serial Handler ] :\033[0m "
@@ -450,22 +454,15 @@ class threadRead(ThreadWithStop):
     def _handle_imu_data(self, payload: bytes):
         """Parse a COMM_GET_IMU_DATA response and publish IMU messages.
 
-        The payload layout (after the leading cmd byte 0x41) is:
-            roll    : float32 big-endian   (degrees)
-            pitch   : float32 big-endian   (degrees)
-            yaw     : float32 big-endian   (degrees)
-            accel_x : float32 big-endian   (m/s^2)
-            accel_y : float32 big-endian   (m/s^2)
-            accel_z : float32 big-endian   (m/s^2)
-            gyro_x  : float32 big-endian   (rad/s)
-            gyro_y  : float32 big-endian   (rad/s)
-            gyro_z  : float32 big-endian   (rad/s)
-            mag_x   : float32 big-endian
-            mag_y   : float32 big-endian
-            mag_z   : float32 big-endian
-            q0..q3  : float32 big-endian x4  (unit quaternion)
+        Decoding is delegated to pyvesc via the GetImuData message class
+        registered in vesc_imu.py (VESCMessage metaclass). This replaces the
+        previous hand-rolled struct.unpack_from approach.
 
-        Total payload (excl. cmd byte): 16 x 4 = 64 bytes.
+        IMPORTANT: the field order/units in vesc_imu.GetImuData.fields must
+        match your firmware's actual COMM_GET_IMU_DATA response layout.  If
+        pyvesc.decode() raises or returns None here, the field list in
+        vesc_imu.py needs adjusting against your firmware's commands.c /
+        datatypes.h (check via VESC Tool -> Firmware).
 
         Publishes:
           - VescImuData  — full dict with rpy / accel / gyro / mag / quat
@@ -476,26 +473,33 @@ class threadRead(ThreadWithStop):
                            expects
 
         Args:
-            payload: Raw payload bytes starting with cmd byte 0x41 (65).
+            payload: Raw payload bytes starting with cmd byte 0x41 (65),
+                as extracted by _extract_short_frames (framing/CRC already
+                validated).
         """
-        # Minimum length: 1 cmd byte + 16 floats * 4 bytes = 65 bytes
-        if len(payload) < 65:
-            if self.debugger:
-                self.logger.warning(
-                    f"[threadRead] IMU payload too short: {len(payload)} bytes "
-                    f"(expected >= 65)"
-                )
-            return
-
         try:
-            data = payload[1:]  # strip cmd byte
-            (
-                roll, pitch, yaw,
-                ax, ay, az,
-                gx, gy, gz,
-                mx, my, mz,
-                q0, q1, q2, q3,
-            ) = struct.unpack_from(">16f", data, 0)
+            # Reconstruct a minimal framed packet so pyvesc.decode() accepts it
+            crc   = _crc16(payload)
+            frame = (
+                bytes([VESC_FRAME_START, len(payload)])
+                + payload
+                + bytes([crc >> 8, crc & 0xFF, VESC_FRAME_END])
+            )
+            msg, _ = pyvesc.decode(frame)
+
+            if msg is None or not isinstance(msg, GetImuData):
+                if self.debugger:
+                    self.logger.warning(
+                        f"[threadRead] pyvesc.decode returned unexpected "
+                        f"result for IMU frame: {msg!r}"
+                    )
+                return
+
+            roll, pitch, yaw = msg.roll, msg.pitch, msg.yaw
+            ax, ay, az       = msg.acc_x, msg.acc_y, msg.acc_z
+            gx, gy, gz       = msg.gyro_x, msg.gyro_y, msg.gyro_z
+            mx, my, mz       = msg.mag_x, msg.mag_y, msg.mag_z
+            q0, q1, q2, q3   = msg.q0, msg.q1, msg.q2, msg.q3
 
             # ── VescImuData (new, full dict) ──────────────────────────────────
             imu_dict = {
@@ -529,42 +533,14 @@ class threadRead(ThreadWithStop):
                 self.logger.info(
                     f"[threadRead] IMU  rpy=({roll:.1f}, {pitch:.1f}, {yaw:.1f}) deg  "
                     f"accel=({ax:.3f}, {ay:.3f}, {az:.3f}) m/s2  "
-                    f"gyro=({gx:.3f}, {gy:.3f}, {gz:.3f}) rad/s"
+                    f"gyro=({gx:.3f}, {gy:.3f}, {gz:.3f}) deg/s"
                 )
 
-        except struct.error as e:
+        except Exception as e:
             print(
                 f"\033[1;97m[ Serial Handler ] :\033[0m "
                 f"\033[1;91mERROR\033[0m - Parsing IMU data ({e})"
             )
-
-    # ──────────────────────────── FW version handler ─────────────────────────────
-
-    def _handle_fw_version(self, payload: bytes):
-        """Handle a COMM_FW_VERSION response used as an alive ping reply.
-
-        The firmware-version response confirms the serial link is alive,
-        matching the role of the Nucleo's 'alive' acknowledgement.
-
-        Publishes:
-          - AliveSignal = True
-          - SerialConnectionState = True
-
-        Args:
-            payload: Raw payload bytes starting with cmd byte 0x00.
-        """
-        self.aliveSignalSender.send(True)
-        self.serialConnectionStateSender.send(True)
-
-        if self.debugger:
-            try:
-                major = payload[1]
-                minor = payload[2]
-                self.logger.info(
-                    f"[threadRead] VESC firmware v{major}.{minor} — alive"
-                )
-            except IndexError:
-                self.logger.info("[threadRead] VESC alive (FW version unreadable)")
 
     # ──────────────────────────── error rate limiting ────────────────────────────
 

@@ -103,7 +103,10 @@ class processSerialHandler(WorkerProcess):
     def __init__(self, queueList, logging, ready_event=None, dashboard_ready=None,
                  debugging=False, example=False):
 
-        logFile = "temp/serial_history.log"
+        import os
+        logDir = os.path.join(os.path.dirname(__file__), "../../../temp")
+        os.makedirs(logDir, exist_ok=True)
+        logFile = os.path.join(logDir, "serial_history.log")
 
         self.logger          = logging
         self.queuesList      = queueList

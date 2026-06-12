@@ -24,6 +24,8 @@ from datetime import datetime, timedelta
 
 import pyvesc
 
+from src.hardware.serialhandler.threads.vesc_imu import GetImuData
+
 from src.utils.messages.allMessages import (
     Brake,
     Control,
@@ -49,11 +51,14 @@ from src.templates.threadwithstop import ThreadWithStop
 # ──────────────────────────────────────────────────────────────────────────────
 
 # Duty-cycle range.  The dashboard/Nucleo protocol used integer percent values
-# in the range [-100, 100].  VESC SetDutyCycle expects a float in [-1.0, 1.0].
-DUTY_SCALE = 1.0 / 100.0          # multiply int speed value by this
+# in the range [-100, 100].  pyvesc SetDutyCycle expects an INTEGER scaled by
+# 100000 (i.e. duty 1.0 = 100000, matching VESC firmware's internal units).
+# DUTY_SCALE converts the dashboard's [-100, 100] percent value into that
+# integer range: percent / 100.0 * 100000 = percent * 1000.
+DUTY_SCALE = 1000          # multiply int speed value by this to get VESC units
 
 # Steering servo range.  The dashboard sends integer degrees in [-25, 25].
-# SetServoPosition expects a float in [0.0, 1.0] where 0.5 = straight ahead.
+# SetPosition expects a float in [0.0, 1.0] where 0.5 = straight ahead.
 # Adjust STEER_HALF_RANGE to match the physical limit of your steering servo.
 STEER_CENTER    = 0.5             # 0.5 = center
 STEER_HALF_RANGE = 25.0           # degrees that map to ±0.5 around center
@@ -84,17 +89,21 @@ def _degrees_to_servo(degrees: float) -> float:
     return max(0.0, min(1.0, pos))
 
 
-def _speed_to_duty(speed_int: int) -> float:
-    """Convert an integer speed percentage [-100, 100] to duty cycle [-1.0, 1.0].
+def _speed_to_duty(speed_int: int) -> int:
+    """Convert an integer speed percentage [-100, 100] to VESC duty units.
+
+    pyvesc's SetDutyCycle field is a raw integer scaled by 100000
+    (duty 1.0 == 100000 in firmware units), with no automatic scaling
+    applied by pyvesc itself — unlike SetPosition, which does scale.
 
     Args:
         speed_int: Integer speed value from the dashboard.
 
     Returns:
-        Duty cycle clamped to [-1.0, 1.0].
+        Integer duty value clamped to [-100000, 100000].
     """
     duty = speed_int * DUTY_SCALE
-    return max(-1.0, min(1.0, duty))
+    return int(max(-100000, min(100000, duty)))
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -233,80 +242,64 @@ class threadWrite(ThreadWithStop):
         duty   = _speed_to_duty(speed_int)
         packet = pyvesc.encode(pyvesc.SetDutyCycle(duty))
         if self.debugger:
-            self.logger.info(f"[threadWrite] SetDutyCycle({duty:.3f})")
+            self.logger.info(f"[threadWrite] SetDutyCycle({duty})")
         self._write_vesc(packet)
 
     def _send_servo(self, steer_degrees: float):
-        """Encode and send a SetServoPosition command.
+        """Encode and send a SetPosition command.
 
         Args:
             steer_degrees: Steering angle in degrees [-25, 25].
         """
         pos    = _degrees_to_servo(steer_degrees)
-        packet = pyvesc.encode(pyvesc.SetServoPosition(pos))
+        packet = pyvesc.encode(pyvesc.SetPosition(pos))
         if self.debugger:
-            self.logger.info(f"[threadWrite] SetServoPosition({pos:.3f})")
-        self.process.lastSteerAngle = steer_degrees
+            self.logger.info(f"[threadWrite] SetPosition({pos:.3f})")
         self._write_vesc(packet)
 
     def _send_brake(self, brake_value: int):
         """Encode and send a SetCurrentBrake command.
 
+        pyvesc's SetCurrentBrake field is a raw integer scaled by 1000
+        (1 A == 1000 in firmware units), with no automatic scaling applied
+        by pyvesc.
+
         Args:
             brake_value: Raw brake value from the dashboard.
         """
-        current = abs(int(brake_value)) * BRAKE_CURRENT_SCALE
-        packet  = pyvesc.encode(pyvesc.SetCurrentBrake(current))
+        current_amps = abs(int(brake_value)) * BRAKE_CURRENT_SCALE
+        current_units = int(current_amps * 1000)  # amps -> milliamp-scaled int
+        packet = pyvesc.encode(pyvesc.SetCurrentBrake(current_units))
         if self.debugger:
-            self.logger.info(f"[threadWrite] SetCurrentBrake({current:.2f} A)")
+            self.logger.info(f"[threadWrite] SetCurrentBrake({current_amps:.2f} A -> {current_units})")
         self._write_vesc(packet)
 
     def _send_imu_poll(self):
-        """Send a COMM_GET_IMU_DATA request (id=65) with mask 0xFFFF.
+        """Send a COMM_GET_IMU_DATA request (id=65) using pyvesc.
 
-        This packet is not in pyvesc and is hand-assembled using the VESC
-        small-frame format:
-            [0x02, payload_len, cmd_byte, mask_hi, mask_lo, crc_hi, crc_lo, 0x03]
+        GetImuData is registered with pyvesc's VESCMessage metaclass (see
+        vesc_imu.py), so pyvesc.encode_request() builds a correctly framed
+        request (with CRC) the same way it does for GetValues. This replaces
+        the previous hand-rolled byte frame, which was not recognized by the
+        firmware and corrupted threadRead's buffer.
         """
-        COMM_GET_IMU_DATA = 65
-        payload = bytes([COMM_GET_IMU_DATA, 0xFF, 0xFF])
-        crc     = self._crc16(payload)
-        frame   = (
-            bytes([0x02, len(payload)])
-            + payload
-            + bytes([crc >> 8, crc & 0xFF, 0x03])
-        )
-        self._write_vesc(frame)
-
-    @staticmethod
-    def _crc16(data: bytes) -> int:
-        """CRC-16/CCITT-FALSE as used by the VESC binary protocol.
-
-        Args:
-            data: Payload bytes (excluding framing and CRC).
-
-        Returns:
-            16-bit CRC integer.
-        """
-        crc = 0
-        for b in data:
-            crc ^= b << 8
-            for _ in range(8):
-                crc = (crc << 1) ^ 0x1021 if (crc & 0x8000) else crc << 1
-        return crc & 0xFFFF
+        packet = pyvesc.encode_request(GetImuData)
+        if self.debugger:
+            self.logger.info("[threadWrite] GetImuData request sent")
+        self._write_vesc(packet)
 
     def _send_alive(self):
         """Send a keep-alive ping.
 
-        The VESC does not have a dedicated alive packet.  The cleanest
-        equivalent is requesting the firmware version — a lightweight round-
-        trip that confirms the link is up and triggers a FWVersion response
-        in threadRead which can be used to update the dashboard connection
-        indicator.
+        pyvesc does not expose a firmware-version getter in this build.
+        GetValues is used instead — a lightweight telemetry request that
+        confirms the link is up.  threadRead._handle_get_values() already
+        processes the response and will publish AliveSignal /
+        SerialConnectionState via _handle_get_values's normal telemetry path.
         """
-        packet = pyvesc.encode(pyvesc.GetFirmwareVersion())
+        packet = pyvesc.encode_request(pyvesc.GetValues)
         if self.debugger:
-            self.logger.info("[threadWrite] GetFirmwareVersion (alive ping)")
+            self.logger.info("[threadWrite] GetValues (alive ping)")
         self._write_vesc(packet)
 
     # ─────────────────────────────── Klem / engine state ────────────────────────
@@ -328,14 +321,14 @@ class threadWrite(ThreadWithStop):
         if kl_value == "30":
             self.running       = True
             self.engineEnabled = True
-            self._write_vesc(pyvesc.encode(pyvesc.SetDutyCycle(0.0)))
+            self._write_vesc(pyvesc.encode(pyvesc.SetDutyCycle(0)))
             if self.debugger:
                 self.logger.info("[threadWrite] KL30 – engine enabled")
 
         elif kl_value == "15":
             self.running       = True
             self.engineEnabled = False
-            self._write_vesc(pyvesc.encode(pyvesc.SetDutyCycle(0.0)))
+            self._write_vesc(pyvesc.encode(pyvesc.SetDutyCycle(0)))
             if self.debugger:
                 self.logger.info("[threadWrite] KL15 – accessories only")
 
@@ -343,8 +336,8 @@ class threadWrite(ThreadWithStop):
             self.running       = False
             self.engineEnabled = False
             # Release braking hold then zero duty
-            self._write_vesc(pyvesc.encode(pyvesc.SetCurrentBrake(0.0)))
-            self._write_vesc(pyvesc.encode(pyvesc.SetDutyCycle(0.0)))
+            self._write_vesc(pyvesc.encode(pyvesc.SetCurrentBrake(0)))
+            self._write_vesc(pyvesc.encode(pyvesc.SetDutyCycle(0)))
             if self.debugger:
                 self.logger.info("[threadWrite] KL0 – full shutdown")
 
@@ -534,8 +527,8 @@ class threadWrite(ThreadWithStop):
         self.exampleFlag = False
         # Safe-stop sequence: zero duty, release brake hold
         try:
-            self._write_vesc(pyvesc.encode(pyvesc.SetCurrentBrake(0.0)))
-            self._write_vesc(pyvesc.encode(pyvesc.SetDutyCycle(0.0)))
+            self._write_vesc(pyvesc.encode(pyvesc.SetCurrentBrake(0)))
+            self._write_vesc(pyvesc.encode(pyvesc.SetDutyCycle(0)))
         except Exception:
             pass
         super(threadWrite, self).stop()
