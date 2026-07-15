@@ -24,7 +24,15 @@ from datetime import datetime, timedelta
 
 import pyvesc
 
-from src.hardware.serialhandler.threads.vesc_imu import GetImuData
+# IMU request is built explicitly (with the required 2-byte mask) because
+# pyvesc.encode_request() emits only the id byte and the firmware would then
+# return no IMU fields.  See vesc_imu.py.
+from src.hardware.serialhandler.threads.vesc_imu import (
+    build_imu_request,
+    build_rpm_command,
+    build_servo_command,
+    build_values_request,
+)
 
 from src.utils.messages.allMessages import (
     Brake,
@@ -47,29 +55,70 @@ from src.templates.threadwithstop import ThreadWithStop
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Steering note
+# ──────────────────────────────────────────────────────────────────────────────
+# Steering uses the VESC servo output (COMM_SET_SERVO_POS, id 33), NOT
+# SetPosition (COMM_SET_POS, motor angle).  The command frame is built by hand
+# in vesc_imu.build_servo_command() so it does not depend on whether this
+# pyvesc build auto-scales its message fields.
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Tuning constants – adjust to match your specific car and VESC configuration
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Duty-cycle range.  The dashboard/Nucleo protocol used integer percent values
-# in the range [-100, 100].  pyvesc SetDutyCycle expects an INTEGER scaled by
-# 100000 (i.e. duty 1.0 = 100000, matching VESC firmware's internal units).
-# DUTY_SCALE converts the dashboard's [-100, 100] percent value into that
-# integer range: percent / 100.0 * 100000 = percent * 1000.
-DUTY_SCALE = 1000          # multiply int speed value by this to get VESC units
+# Scaling note (IMPORTANT):
+# This pyvesc build does NOT auto-scale SetDutyCycle / SetCurrentBrake — it
+# packs the value you pass straight into an integer field. So we must pass
+# PRE-SCALED INTEGERS:
+#   * duty : percent[-100,100] × 1000  → [-100000, 100000]   (100000 = duty 1.0)
+#   * brake: amps × 1000               (firmware current units)
+# Passing a float to these throws "required argument is not an integer".
+# (Steering is hand-framed in vesc_imu.build_servo_command, so it is unaffected.)
+# Verify once with the hex you log in _write_vesc: a 100% duty command must
+# serialise to payload "05 00 01 86 a0" (id 5, then 100000 = 0x000186A0).
+DUTY_SCALE = 1000          # multiply the [-100,100] speed value by this
 
 # Steering servo range.  The dashboard sends integer degrees in [-25, 25].
-# SetPosition expects a float in [0.0, 1.0] where 0.5 = straight ahead.
+# SetServoPosition expects a float in [0.0, 1.0] where 0.5 = straight ahead.
 # Adjust STEER_HALF_RANGE to match the physical limit of your steering servo.
-STEER_CENTER    = 0.5             # 0.5 = center
+STEER_CENTER     = 0.5            # 0.5 = center
 STEER_HALF_RANGE = 25.0           # degrees that map to ±0.5 around center
 
-# IMU polling interval in seconds.  50 Hz is a sensible default.
-IMU_POLL_INTERVAL = 0.02
+# IMU polling interval in seconds.  20 Hz keeps serial load modest.
+IMU_POLL_INTERVAL = 0.05
+
+# Telemetry (GetValues) polling interval.  The VESC only answers when asked, so
+# we must poll it for the dashboard feedback (speed, battery, steer echo).
+# 10 Hz is plenty for the gauges.
+TELEMETRY_POLL_INTERVAL = 0.1
 
 # Brake current in amps sent when a brake command is received.
 # The original Nucleo protocol repurposed "steerAngle" as the brake value;
 # map it directly to regenerative braking current here.
-BRAKE_CURRENT_SCALE = 1.0         # 1 A per unit from dashboard
+BRAKE_CURRENT_SCALE = 1.0         # amps per unit from dashboard
+
+# ── Closed-loop speed control (cm/s) ──────────────────────────────────────────
+# SpeedMotor from the dashboard is treated as a target speed in cm/s and driven
+# via the VESC's closed-loop RPM control, so the number means real cm/s rather
+# than throttle %.  These drivetrain constants MUST match threadRead.py (they
+# are the inverse of its eRPM→speed conversion).
+MOTOR_POLE_PAIRS      = 4
+GEAR_RATIO            = 11.84
+WHEEL_CIRCUMFERENCE_M = 0.314
+MAX_SPEED_CMS         = 60.0      # safety clamp on the commanded speed
+# Below this |cm/s| we coast (duty 0) instead of commanding RPM, because
+# sensorless FOC cannot hold a near-zero RPM cleanly. Low-speed behaviour is
+# left to the VESC's own open-loop/sensorless tuning.
+MIN_DRIVE_CMS         = 0.5
+
+# Output refresh (keep-alive): unlike the Nucleo, the VESC does NOT hold a
+# setpoint indefinitely — it stops the motor if it receives no command within
+# its configured timeout (VESC Tool → App → General → timeout).  The dashboard
+# sends discrete setpoints, not a continuous stream, so we re-send the last
+# commanded duty + servo position at this interval to keep them applied until
+# the setpoint changes or the engine is switched off.
+REFRESH_INTERVAL = 0.1            # seconds (10 Hz keep-alive)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -92,9 +141,9 @@ def _degrees_to_servo(degrees: float) -> float:
 def _speed_to_duty(speed_int: int) -> int:
     """Convert an integer speed percentage [-100, 100] to VESC duty units.
 
-    pyvesc's SetDutyCycle field is a raw integer scaled by 100000
-    (duty 1.0 == 100000 in firmware units), with no automatic scaling
-    applied by pyvesc itself — unlike SetPosition, which does scale.
+    Returns a PRE-SCALED INTEGER in [-100000, 100000] (100000 == duty 1.0),
+    because this pyvesc build packs SetDutyCycle as a raw integer with no
+    internal scaling.
 
     Args:
         speed_int: Integer speed value from the dashboard.
@@ -102,8 +151,26 @@ def _speed_to_duty(speed_int: int) -> int:
     Returns:
         Integer duty value clamped to [-100000, 100000].
     """
-    duty = speed_int * DUTY_SCALE
+    duty = int(speed_int) * DUTY_SCALE
     return int(max(-100000, min(100000, duty)))
+
+
+def _speed_cms_to_erpm(cms: float) -> int:
+    """Convert a target speed in cm/s to electrical RPM for SetRPM.
+
+    Inverse of threadRead._erpm_to_ms, using the same drivetrain constants.
+
+    Args:
+        cms: Target speed in cm/s (signed).
+
+    Returns:
+        Electrical RPM (signed int).
+    """
+    m_s        = cms / 100.0
+    wheel_rps  = m_s / WHEEL_CIRCUMFERENCE_M       # wheel revolutions / second
+    motor_rpm  = wheel_rps * 60.0 * GEAR_RATIO
+    erpm       = motor_rpm * MOTOR_POLE_PAIRS
+    return int(round(erpm))
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -133,7 +200,7 @@ class threadWrite(ThreadWithStop):
 
     def __init__(self, process, logFile, queues, logger,
                  debugger=False, example=False):
-        super(threadWrite, self).__init__(pause=0.001)
+        super(threadWrite, self).__init__(pause=0.005)
 
         self.process     = process
         self.queuesList  = queues
@@ -146,8 +213,19 @@ class threadWrite(ThreadWithStop):
         self.running       = False
         self.engineEnabled = False
 
-        # IMU polling timestamp
+        # IMU polling timestamp / enable flag
         self._last_imu_poll = 0.0
+        self._imu_enabled   = True
+
+        # Telemetry (GetValues) polling timestamp
+        self._last_telem_poll = 0.0
+
+        # Held output setpoints, re-sent periodically to keep the VESC alive.
+        self._cur_duty     = 0                        # pre-scaled duty units
+        self._cur_rpm      = 0                        # electrical RPM setpoint
+        self._drive_mode   = "duty"                   # "duty" or "rpm"
+        self._cur_servo    = _degrees_to_servo(0.0)   # 0.5 = centre
+        self._last_refresh = 0.0
 
         # Error rate-limiting
         self.last_error_time = None
@@ -212,7 +290,7 @@ class threadWrite(ThreadWithStop):
         Acquires the shared serial lock so threadRead can safely coexist.
 
         Args:
-            packet: Raw bytes to write (already framed + CRC by pyvesc).
+            packet: Raw bytes to write (already framed + CRC).
 
         Returns:
             True on success, False on failure.
@@ -234,59 +312,110 @@ class threadWrite(ThreadWithStop):
         return False
 
     def _send_duty(self, speed_int: int):
-        """Encode and send a SetDutyCycle command.
+        """Set the held duty setpoint and send it (open-loop).
+
+        Also selects duty drive-mode so the keep-alive refreshes duty.
 
         Args:
             speed_int: Integer speed in percent [-100, 100].
         """
-        duty   = _speed_to_duty(speed_int)
-        packet = pyvesc.encode(pyvesc.SetDutyCycle(duty))
+        self._cur_duty   = _speed_to_duty(speed_int)
+        self._drive_mode = "duty"
+        packet = pyvesc.encode(pyvesc.SetDutyCycle(self._cur_duty))
         if self.debugger:
-            self.logger.info(f"[threadWrite] SetDutyCycle({duty})")
+            self.logger.info(f"[threadWrite] SetDutyCycle({self._cur_duty})")
         self._write_vesc(packet)
 
+    def _send_rpm(self, erpm: int):
+        """Set the held eRPM setpoint and send it (closed-loop speed control).
+
+        Selects rpm drive-mode so the keep-alive refreshes RPM.
+
+        Args:
+            erpm: Electrical RPM (signed).
+        """
+        self._cur_rpm    = int(erpm)
+        self._drive_mode = "rpm"
+        packet = build_rpm_command(self._cur_rpm)
+        if self.debugger:
+            self.logger.info(f"[threadWrite] SetRPM({self._cur_rpm})")
+        self._write_vesc(packet)
+
+    def _send_speed_cms(self, cms: float):
+        """Drive a target speed in cm/s via closed-loop RPM.
+
+        Clamps to ±MAX_SPEED_CMS. Near-zero coasts (duty 0) rather than
+        commanding RPM 0, which sensorless FOC can't hold cleanly. Low-speed
+        behaviour is left to the VESC's own open-loop/sensorless tuning.
+
+        Args:
+            cms: Target speed in cm/s (signed).
+        """
+        cms = max(-MAX_SPEED_CMS, min(MAX_SPEED_CMS, cms))
+        if abs(cms) < MIN_DRIVE_CMS:
+            self._send_duty(0)                       # coast to stop
+        else:
+            self._send_rpm(_speed_cms_to_erpm(cms))
+
     def _send_servo(self, steer_degrees: float):
-        """Encode and send a SetPosition command.
+        """Set the held servo setpoint and send it (steering).
+
+        Also records the commanded angle on the parent process so threadRead
+        can publish CurrentSteer (the VESC does not echo servo position).
 
         Args:
             steer_degrees: Steering angle in degrees [-25, 25].
         """
-        pos    = _degrees_to_servo(steer_degrees)
-        packet = pyvesc.encode(pyvesc.SetPosition(pos))
+        pos = _degrees_to_servo(steer_degrees)
+        self._cur_servo = pos
+        self.process.lastSteerAngle = float(steer_degrees)
+        packet = build_servo_command(pos)  # hand-framed COMM_SET_SERVO_POS
         if self.debugger:
-            self.logger.info(f"[threadWrite] SetPosition({pos:.3f})")
+            self.logger.info(f"[threadWrite] SetServoPos({pos:.3f})")
         self._write_vesc(packet)
+
+    def _refresh_outputs(self):
+        """Re-send the last drive + servo setpoint to keep the VESC alive.
+
+        The VESC stops the motor if it receives no command within its
+        configured timeout, so held setpoints must be refreshed periodically
+        (it does not latch a setpoint the way the Nucleo firmware did).
+        """
+        if self._drive_mode == "rpm":
+            self._write_vesc(build_rpm_command(self._cur_rpm))
+        else:
+            self._write_vesc(pyvesc.encode(pyvesc.SetDutyCycle(self._cur_duty)))
+        self._write_vesc(build_servo_command(self._cur_servo))
 
     def _send_brake(self, brake_value: int):
         """Encode and send a SetCurrentBrake command.
 
-        pyvesc's SetCurrentBrake field is a raw integer scaled by 1000
-        (1 A == 1000 in firmware units), with no automatic scaling applied
-        by pyvesc.
+        Passes braking current in amps; pyvesc scales it ×1000 internally.
 
         Args:
             brake_value: Raw brake value from the dashboard.
         """
-        current_amps = abs(int(brake_value)) * BRAKE_CURRENT_SCALE
-        current_units = int(current_amps * 1000)  # amps -> milliamp-scaled int
+        current_amps  = abs(int(brake_value)) * BRAKE_CURRENT_SCALE
+        current_units = int(current_amps * 1000)  # amps -> firmware integer units
+        self._cur_duty   = 0                       # stop driving; refresh sends 0
+        self._cur_rpm    = 0
+        self._drive_mode = "duty"
         packet = pyvesc.encode(pyvesc.SetCurrentBrake(current_units))
         if self.debugger:
-            self.logger.info(f"[threadWrite] SetCurrentBrake({current_amps:.2f} A -> {current_units})")
+            self.logger.info(
+                f"[threadWrite] SetCurrentBrake({current_amps:.2f} A -> {current_units})"
+            )
         self._write_vesc(packet)
 
     def _send_imu_poll(self):
-        """Send a COMM_GET_IMU_DATA request (id=65) using pyvesc.
+        """Send a framed COMM_GET_IMU_DATA request (id=65) with mask 0xFFFF.
 
-        GetImuData is registered with pyvesc's VESCMessage metaclass (see
-        vesc_imu.py), so pyvesc.encode_request() builds a correctly framed
-        request (with CRC) the same way it does for GetValues. This replaces
-        the previous hand-rolled byte frame, which was not recognized by the
-        firmware and corrupted threadRead's buffer.
+        build_imu_request() includes the 2-byte field mask the firmware
+        requires; without it the VESC returns no IMU floats.
         """
-        packet = pyvesc.encode_request(GetImuData)
         if self.debugger:
             self.logger.info("[threadWrite] GetImuData request sent")
-        self._write_vesc(packet)
+        self._write_vesc(build_imu_request())
 
     def _send_alive(self):
         """Send a keep-alive ping.
@@ -295,9 +424,9 @@ class threadWrite(ThreadWithStop):
         GetValues is used instead — a lightweight telemetry request that
         confirms the link is up.  threadRead._handle_get_values() already
         processes the response and will publish AliveSignal /
-        SerialConnectionState via _handle_get_values's normal telemetry path.
+        SerialConnectionState via its normal telemetry path.
         """
-        packet = pyvesc.encode_request(pyvesc.GetValues)
+        packet = build_values_request()
         if self.debugger:
             self.logger.info("[threadWrite] GetValues (alive ping)")
         self._write_vesc(packet)
@@ -321,6 +450,10 @@ class threadWrite(ThreadWithStop):
         if kl_value == "30":
             self.running       = True
             self.engineEnabled = True
+            self._cur_duty     = 0                 # start stopped
+            self._cur_rpm      = 0
+            self._drive_mode   = "duty"
+            self._last_refresh = time.time()
             self._write_vesc(pyvesc.encode(pyvesc.SetDutyCycle(0)))
             if self.debugger:
                 self.logger.info("[threadWrite] KL30 – engine enabled")
@@ -335,6 +468,9 @@ class threadWrite(ThreadWithStop):
         elif kl_value == "0":
             self.running       = False
             self.engineEnabled = False
+            self._cur_duty     = 0
+            self._cur_rpm      = 0
+            self._drive_mode   = "duty"
             # Release braking hold then zero duty
             self._write_vesc(pyvesc.encode(pyvesc.SetCurrentBrake(0)))
             self._write_vesc(pyvesc.encode(pyvesc.SetDutyCycle(0)))
@@ -398,7 +534,8 @@ class threadWrite(ThreadWithStop):
         2. Alive ping.
         3. Steer-limits request.
         4. Motor commands (speed, steer, brake, control) — only when running
-           and engine is enabled.
+           and engine is enabled.  Held setpoints are re-sent (keep-alive) so
+           the VESC keeps applying them.
         5. Toggle commands — always processed while running.
         6. Periodic IMU poll — rate-limited independently.
         """
@@ -440,13 +577,15 @@ class threadWrite(ThreadWithStop):
                 if speed_recv is not None:
                     if self.debugger:
                         self.logger.info(speed_recv)
-                    self._send_duty(int(speed_recv))
+                    # SpeedMotor arrives as cm/s × 10 (deci-cm/s); convert to cm/s.
+                    self._send_speed_cms(float(speed_recv) / 10.0)
 
                 steer_recv = self.steerMotorSubscriber.receive()
                 if steer_recv is not None:
                     if self.debugger:
                         self.logger.info(steer_recv)
-                    self._send_servo(float(steer_recv))
+                    # SteerMotor arrives as degrees × 10 (decidegrees); convert.
+                    self._send_servo(float(steer_recv) / 10.0)
 
                 # Compound vehicle command (time-boxed speed + steer)
                 control_recv = self.controlSubscriber.receive()
@@ -468,6 +607,12 @@ class threadWrite(ThreadWithStop):
                     self._send_servo(float(calib_recv["Steer"]))
                     delay = int(calib_recv["Time"]) / 1000.0
                     threading.Timer(delay, lambda: self._send_duty(0)).start()
+
+                # ── Keep-alive: re-send held duty + servo so the VESC, which
+                #    does not latch setpoints, keeps applying them. ───────────
+                if (time.time() - self._last_refresh) >= REFRESH_INTERVAL:
+                    self._refresh_outputs()
+                    self._last_refresh = time.time()
 
             # ── 5. Toggle commands ────────────────────────────────────────────
             if self.running:
@@ -498,11 +643,21 @@ class threadWrite(ThreadWithStop):
             # ── 6. Periodic IMU poll ──────────────────────────────────────────
             if (
                 self.running
-                and getattr(self, "_imu_enabled", True)
+                and self._imu_enabled
                 and (time.time() - self._last_imu_poll) >= IMU_POLL_INTERVAL
             ):
                 self._send_imu_poll()
                 self._last_imu_poll = time.time()
+
+            # ── 7. Periodic telemetry poll (GetValues) ────────────────────────
+            # Drives the dashboard speed gauge, battery level and steer echo.
+            # The VESC does not stream telemetry; it only replies when asked.
+            if (
+                self.running
+                and (time.time() - self._last_telem_poll) >= TELEMETRY_POLL_INTERVAL
+            ):
+                self._write_vesc(build_values_request())
+                self._last_telem_poll = time.time()
 
         except Exception as e:
             print(

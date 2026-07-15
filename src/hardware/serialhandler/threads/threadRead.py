@@ -18,15 +18,15 @@
 # IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
 # ARE DISCLAIMED.
 
-import math
 import os
-import struct
 import threading
 from datetime import datetime, timedelta
 
 import pyvesc
 
-from src.hardware.serialhandler.threads.vesc_imu import GetImuData
+# IMU is parsed by the mask-aware helper in vesc_imu.py (pyvesc cannot handle
+# the 2-byte field mask that precedes the IMU floats).
+from src.hardware.serialhandler.threads.vesc_imu import to_imu_dict, parse_get_values
 
 from src.templates.threadwithstop import ThreadWithStop
 from src.utils.messages.allMessages import (
@@ -55,24 +55,36 @@ from src.utils.messages.messageHandlerSender import messageHandlerSender
 # ──────────────────────────────────────────────────────────────────────────────
 
 # Motor pole pairs × gear ratio.  Used to convert electrical RPM → wheel RPM.
-# Example: 7 pole-pairs, 4.00:1 gearbox  →  MOTOR_POLE_PAIRS = 7, GEAR_RATIO = 4.0
-MOTOR_POLE_PAIRS = 7
-GEAR_RATIO       = 4.0
+# Example: 4 pole-pairs, 13:54 x 2.85 gearbox  →  MOTOR_POLE_PAIRS = 4, GEAR_RATIO = 11.84
+MOTOR_POLE_PAIRS = 4
+GEAR_RATIO       = 11.84
 
 # Wheel circumference in metres.  Used to convert wheel RPM → m/s.
-# Example: 60 mm radius  →  2 × π × 0.060 ≈ 0.377 m
-WHEEL_CIRCUMFERENCE_M = 0.377
+# Example: 50 mm radius  →  2 × π × 0.050 ≈ 0.314 m
+WHEEL_CIRCUMFERENCE_M = 0.314
 
 # LiPo cell count and nominal full/empty voltages.  Used to convert VESC
 # v_in (volts) to the integer percentage expected by BatteryLvl consumers.
-# 3S: 12.6 V full / 9.0 V empty.  Adjust to your pack.
-BATTERY_CELLS         = 3
+# 4S: 16.8 V full / 12.0 V empty.  Adjust to your pack.
+BATTERY_CELLS         = 4
 CELL_VOLTAGE_FULL     = 4.2    # volts per cell at 100 %
 CELL_VOLTAGE_EMPTY    = 3.0    # volts per cell at 0 %
-BATTERY_VOLTAGE_FULL  = BATTERY_CELLS * CELL_VOLTAGE_FULL   # 12.6 V
-BATTERY_VOLTAGE_EMPTY = BATTERY_CELLS * CELL_VOLTAGE_EMPTY  # 9.0 V
+BATTERY_VOLTAGE_FULL  = BATTERY_CELLS * CELL_VOLTAGE_FULL   # 16.8 V
+BATTERY_VOLTAGE_EMPTY = BATTERY_CELLS * CELL_VOLTAGE_EMPTY  # 12.0 V
+
+# IMU unit conversion (set to match what you measured on the bench).
+# VESC FW 6.x/7.x report accel in g and gyro in deg/s by default.
+IMU_ACCEL_IN_MS2 = False   # True → convert g to m/s²
+IMU_GYRO_IN_RAD  = False   # True → convert deg/s to rad/s
+
+# Instant-consumption gauge: the widget is labelled "Ah" and displays the value
+# it receives divided by 1000 (probe: sent 1000 -> showed 1.0 Ah), on a ~0-5
+# scale. That is consumed charge, not instantaneous current, so feed it the
+# VESC's amp_hours (consumed charge in Ah) scaled up by 1000.
+AMPHOURS_TO_GAUGE = 1000.0
 
 # VESC binary protocol constants
+COMM_GET_VALUES   = 4      # packet ID for motor telemetry response
 COMM_GET_IMU_DATA = 65     # packet ID for IMU response
 VESC_FRAME_START  = 0x02   # short-frame start byte
 VESC_FRAME_END    = 0x03   # frame stop byte
@@ -81,6 +93,19 @@ VESC_FRAME_END    = 0x03   # frame stop byte
 # ──────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ──────────────────────────────────────────────────────────────────────────────
+
+def _attr(msg, *names, default=0.0):
+    """Return the first present attribute of ``msg`` among ``names``.
+
+    pyvesc GetValues field names differ between builds (e.g. ``v_in`` vs
+    ``input_voltage``, ``avg_motor_current`` vs ``current_motor``).  Trying
+    several names avoids silently reading zeros when the name doesn't match.
+    """
+    for n in names:
+        if hasattr(msg, n):
+            return getattr(msg, n)
+    return default
+
 
 def _erpm_to_ms(erpm: float) -> float:
     """Convert electrical RPM reported by VESC to vehicle speed in m/s.
@@ -113,7 +138,7 @@ def _voltage_to_battery_pct(v_in: float) -> int:
 
 
 def _crc16(data: bytes) -> int:
-    """CRC-16/CCITT-FALSE used by the VESC binary protocol.
+    """CRC-16/XMODEM (poly 0x1021, init 0x0000, no reflection) used by VESC.
 
     Args:
         data: Payload bytes (excluding framing bytes and CRC itself).
@@ -150,7 +175,7 @@ def _extract_short_frames(buf: bytes):
             continue
 
         # Need at least: start(1) + len(1) + payload(>=1) + crc(2) + stop(1) = 6
-        if i + 5 > len(buf):
+        if i + 6 > len(buf):
             break
 
         payload_len = buf[i + 1]
@@ -347,7 +372,7 @@ class threadRead(ThreadWithStop):
 
         cmd_id = payload[0]
 
-        if cmd_id == 4:
+        if cmd_id == COMM_GET_VALUES:
             # COMM_GET_VALUES — motor telemetry
             self._handle_get_values(payload)
 
@@ -374,72 +399,47 @@ class threadRead(ThreadWithStop):
           - BatteryLvl        — percentage converted from v_in
           - InstantConsumption— current_in in amps
 
-        The pyvesc decode() function handles the binary unpacking.
-
         Args:
             payload: Raw payload bytes starting with cmd byte 0x04.
         """
         try:
-            # Reconstruct a minimal framed packet so pyvesc.decode() accepts it
-            crc   = _crc16(payload)
-            frame = (
-                bytes([VESC_FRAME_START, len(payload)])
-                + payload
-                + bytes([crc >> 8, crc & 0xFF, VESC_FRAME_END])
-            )
-            msg, _ = pyvesc.decode(frame)
-
-            if msg is None:
+            telemetry = parse_get_values(payload)
+            if telemetry is None:
                 if self.debugger:
-                    self.logger.warning(
-                        "[threadRead] pyvesc.decode returned None for GetValues"
-                    )
+                    self.logger.warning("[threadRead] GetValues parse failed")
                 return
 
-            # ── VescTelemetry (new, full dict) ────────────────────────────────
-            telemetry = {
-                "rpm":            float(getattr(msg, "rpm",            0)),
-                "duty_cycle":     float(getattr(msg, "duty_now",       0)),
-                "voltage":        float(getattr(msg, "v_in",           0)),
-                "current_motor":  float(getattr(msg, "current_motor",  0)),
-                "current_in":     float(getattr(msg, "current_in",     0)),
-                "tachometer":     int(getattr(msg,   "tachometer",     0)),
-                "tachometer_abs": int(getattr(msg,   "tachometer_abs", 0)),
-                "temp_fet":       float(getattr(msg, "temp_fet",       0)),
-                "mc_fault_code":  int(getattr(msg,   "mc_fault_code",  0)
-                                     if not isinstance(
-                                         getattr(msg, "mc_fault_code", 0), bytes
-                                     ) else 0),
-            }
             self.vescTelemetrySender.send(telemetry)
 
             if self.debugger:
                 self.logger.info(f"[threadRead] VescTelemetry: {telemetry}")
 
-            # ── CurrentSpeed (legacy, in m/s) ─────────────────────────────────
+            # ── CurrentSpeed ─ dashboard wants mm/s as float (shows value/10 cm/s)
             speed_ms = _erpm_to_ms(telemetry["rpm"])
-            self.currentSpeedSender.send(float(speed_ms))
+            self.currentSpeedSender.send(float(round(speed_ms * 1000.0, 1)))
 
-            # ── CurrentSteer (legacy — echoed from last commanded servo angle)
+            # ── CurrentSteer ─ dashboard wants decidegrees (shows value/10 as °)
             # threadWrite writes process.lastSteerAngle = float(degrees) every
             # time it calls _send_servo(), so both threads share state without
             # an extra queue round-trip.
             last_steer = getattr(self.process, "lastSteerAngle", 0.0)
-            self.currentSteerSender.send(float(last_steer))
+            self.currentSteerSender.send(float(round(last_steer * 10.0, 1)))
 
             # ── BatteryLvl (legacy, gated by toggle flag) ─────────────────────
             if getattr(self.process, "batteryEnabled", True):
                 pct = _voltage_to_battery_pct(telemetry["voltage"])
                 self.batteryLvlSender.send(pct)
 
-            # ── InstantConsumption (legacy, gated by toggle flag) ─────────────
+            # ── InstantConsumption ─ gauge is "Ah" and shows value/1000, so
+            #    feed it consumed charge (amp_hours) ×1000.
             if getattr(self.process, "instantEnabled", True):
-                self.instantConsumptionSender.send(telemetry["current_in"])
+                self.instantConsumptionSender.send(
+                    float(round(telemetry["amp_hours"] * AMPHOURS_TO_GAUGE, 1))
+                )
 
             # ── Alive confirmation ─────────────────────────────────────────────
-            # GetValues is now also used as the alive ping (threadWrite has no
-            # dedicated firmware-version getter available in this pyvesc build).
-            # Any successfully decoded GetValues response confirms the link is up.
+            # GetValues doubles as the alive ping; a successful decode confirms
+            # the link is up.
             self.aliveSignalSender.send(True)
             self.serialConnectionStateSender.send(True)
 
@@ -454,15 +454,10 @@ class threadRead(ThreadWithStop):
     def _handle_imu_data(self, payload: bytes):
         """Parse a COMM_GET_IMU_DATA response and publish IMU messages.
 
-        Decoding is delegated to pyvesc via the GetImuData message class
-        registered in vesc_imu.py (VESCMessage metaclass). This replaces the
-        previous hand-rolled struct.unpack_from approach.
-
-        IMPORTANT: the field order/units in vesc_imu.GetImuData.fields must
-        match your firmware's actual COMM_GET_IMU_DATA response layout.  If
-        pyvesc.decode() raises or returns None here, the field list in
-        vesc_imu.py needs adjusting against your firmware's commands.c /
-        datatypes.h (check via VESC Tool -> Firmware).
+        Parsing is mask-aware (see vesc_imu.to_imu_dict): the firmware sends a
+        2-byte field mask after the id byte, then one big-endian float32 per
+        set bit.  This handles 9-axis IMUs (without magnetometer) and degrades
+        gracefully on 6-axis parts.
 
         Publishes:
           - VescImuData  — full dict with rpy / accel / gyro / mag / quat
@@ -473,43 +468,36 @@ class threadRead(ThreadWithStop):
                            expects
 
         Args:
-            payload: Raw payload bytes starting with cmd byte 0x41 (65),
-                as extracted by _extract_short_frames (framing/CRC already
-                validated).
+            payload: Raw payload bytes starting with cmd byte 65, as extracted
+                by _extract_short_frames (framing/CRC already validated).
         """
         try:
-            # Reconstruct a minimal framed packet so pyvesc.decode() accepts it
-            crc   = _crc16(payload)
-            frame = (
-                bytes([VESC_FRAME_START, len(payload)])
-                + payload
-                + bytes([crc >> 8, crc & 0xFF, VESC_FRAME_END])
+            imu = to_imu_dict(
+                payload,
+                accel_in_ms2=IMU_ACCEL_IN_MS2,
+                gyro_in_rad=IMU_GYRO_IN_RAD,
             )
-            msg, _ = pyvesc.decode(frame)
-
-            if msg is None or not isinstance(msg, GetImuData):
+            if not imu:
                 if self.debugger:
                     self.logger.warning(
-                        f"[threadRead] pyvesc.decode returned unexpected "
-                        f"result for IMU frame: {msg!r}"
+                        "[threadRead] IMU payload could not be parsed "
+                        f"({len(payload)} bytes)"
                     )
                 return
 
-            roll, pitch, yaw = msg.roll, msg.pitch, msg.yaw
-            ax, ay, az       = msg.acc_x, msg.acc_y, msg.acc_z
-            gx, gy, gz       = msg.gyro_x, msg.gyro_y, msg.gyro_z
-            mx, my, mz       = msg.mag_x, msg.mag_y, msg.mag_z
-            q0, q1, q2, q3   = msg.q0, msg.q1, msg.q2, msg.q3
+            roll, pitch, yaw = imu["roll"], imu["pitch"], imu["yaw"]
+            ax, ay, az       = imu["accel"]
+            gx, gy, gz       = imu["gyro"]
 
             # ── VescImuData (new, full dict) ──────────────────────────────────
             imu_dict = {
                 "roll":  round(roll,  4),
                 "pitch": round(pitch, 4),
                 "yaw":   round(yaw,   4),
-                "accel": [round(ax, 4), round(ay, 4), round(az, 4)],
-                "gyro":  [round(gx, 4), round(gy, 4), round(gz, 4)],
-                "mag":   [round(mx, 4), round(my, 4), round(mz, 4)],
-                "quat":  [round(q0, 6), round(q1, 6), round(q2, 6), round(q3, 6)],
+                "accel": [round(v, 4) for v in imu["accel"]],
+                "gyro":  [round(v, 4) for v in imu["gyro"]],
+                "mag":   [round(v, 4) for v in imu["mag"]],
+                "quat":  [round(v, 6) for v in imu["quat"]],
             }
             self.vescImuDataSender.send(imu_dict)
 
@@ -530,10 +518,12 @@ class threadRead(ThreadWithStop):
                 self._imu_ack_sent = True
 
             if self.debugger:
+                acc_unit  = "m/s2" if IMU_ACCEL_IN_MS2 else "g"
+                gyro_unit = "rad/s" if IMU_GYRO_IN_RAD else "deg/s"
                 self.logger.info(
                     f"[threadRead] IMU  rpy=({roll:.1f}, {pitch:.1f}, {yaw:.1f}) deg  "
-                    f"accel=({ax:.3f}, {ay:.3f}, {az:.3f}) m/s2  "
-                    f"gyro=({gx:.3f}, {gy:.3f}, {gz:.3f}) deg/s"
+                    f"accel=({ax:.3f}, {ay:.3f}, {az:.3f}) {acc_unit}  "
+                    f"gyro=({gx:.3f}, {gy:.3f}, {gz:.3f}) {gyro_unit}"
                 )
 
         except Exception as e:

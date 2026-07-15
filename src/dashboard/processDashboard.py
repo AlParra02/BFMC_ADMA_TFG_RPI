@@ -135,6 +135,8 @@ class processDashboard(WorkerProcess):
         self.get_name_and_vals()
         self.messagesAndVals.pop("mainCamera", None)
         self.messagesAndVals.pop("Semaphores", None)
+        self.messagesAndVals.pop("VescImuData", None)     # add
+        self.messagesAndVals.pop("VescTelemetry", None)   # add
         self.subscribe()
     
 
@@ -450,10 +452,10 @@ class processDashboard(WorkerProcess):
                     self.serialConnected = resp
 
                 self.socketio.emit(msg, {"value": resp})
-                if self.debugging:
+                if self.debugging and msg not in ("serialCamera", "mainCamera"):
                     self.logger.info(f"{msg}: {resp}")
 
-        eventlet.spawn_after(0.1, self.send_continuous_messages)
+        eventlet.spawn_after(1, self.send_continuous_messages)
 
 
     def send_hardware_data_to_frontend(self):

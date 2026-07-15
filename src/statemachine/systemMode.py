@@ -92,7 +92,7 @@ class SystemMode(Enum):
                 "enabled": True,
             },
             "thread": {
-                "resolution": "1080p",
+                "resolution": "720p",
             }
         },
         "serial_handler": {
@@ -119,7 +119,7 @@ class SystemMode(Enum):
                 "enabled": True,
             },
             "thread": {
-                "resolution": "1080p",
+                "resolution": "720p",
             }
         },
         "serial_handler": {

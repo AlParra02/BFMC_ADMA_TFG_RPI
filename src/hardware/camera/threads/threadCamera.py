@@ -47,6 +47,20 @@ from src.utils.messages.allMessages import StateChange
 from src.utils.messages.messageHandlerSubscriber import messageHandlerSubscriber
 from src.statemachine.systemMode import SystemMode
 
+
+# ── Camera tuning ─────────────────────────────────────────────────────────────
+# Lower these to cut CPU/encoding load and reduce dashboard lag.
+#   MAIN_SIZE  : high-res stream (recording / autonomous). 2048x1080 is heavy on
+#                a Pi; 1280x720 or 640x480 are much cheaper.
+#   LORES_SIZE : the stream shown on the dashboard. Smaller = less to encode/send.
+#   TARGET_FPS : cap how often we capture+encode. The camera can deliver ~30 fps;
+#                encoding two JPEGs that fast is the main cost. 10 fps is smooth
+#                for a live feed; drop to 5 for the lowest load.
+MAIN_SIZE  = (1280, 720)   # was (2048, 1080)
+LORES_SIZE = (320, 180)    # dashboard feed (can go to (320, 180) for less load)
+TARGET_FPS = 10            # capture/encode rate cap
+
+
 class threadCamera(ThreadWithStop):
     """Thread which will handle camera functionalities.\n
     Args:
@@ -63,6 +77,9 @@ class threadCamera(ThreadWithStop):
         self.debugger = debugger
         self.frame_rate = 5
         self.recording = False
+        # Frame-rate cap for capture/encode (see TARGET_FPS).
+        self._frame_interval = 1.0 / TARGET_FPS
+        self._last_frame_t = 0.0
 
         self.video_writer = ""
 
@@ -99,7 +116,15 @@ class threadCamera(ThreadWithStop):
         if self.camera is None:
             time.sleep(0.1)
             return
-            
+
+        # Frame-rate cap: skip until the next frame is due, so we don't
+        # capture+encode flat-out (the main source of camera CPU load / lag).
+        now = time.time()
+        if now - self._last_frame_t < self._frame_interval:
+            time.sleep(0.002)
+            return
+        self._last_frame_t = now
+
         try:
             recordRecv = self.recordSubscriber.receive()
             if recordRecv is not None: 
@@ -114,7 +139,7 @@ class threadCamera(ThreadWithStop):
                         "output_video" + str(time.time()) + ".avi",
                         fourcc,
                         self.frame_rate,
-                        (2048, 1080),
+                        MAIN_SIZE,
                     )
 
         except Exception as e:
@@ -130,7 +155,7 @@ class threadCamera(ThreadWithStop):
             serialRequest = cv2.cvtColor(serialRequest, cv2.COLOR_YUV2BGR_I420) # type: ignore
 
             _, mainEncodedImg = cv2.imencode(".jpg", mainRequest) # type: ignore
-            _, serialEncodedImg = cv2.imencode(".jpg", serialRequest) # type: ignore
+            _, serialEncodedImg = cv2.imencode(".jpg", serialRequest) # type: ignor
 
             mainEncodedImageData = base64.b64encode(mainEncodedImg).decode("utf-8") # type: ignore
             serialEncodedImageData = base64.b64encode(serialEncodedImg).decode("utf-8") # type: ignore
@@ -167,8 +192,8 @@ class threadCamera(ThreadWithStop):
             config = self.camera.create_preview_configuration(
                 buffer_count=1,
                 queue=False,
-                main={"format": "RGB888", "size": (2048, 1080)},
-                lores={"size": (512, 270)},
+                main={"format": "RGB888", "size": MAIN_SIZE},
+                lores={"size": LORES_SIZE},
                 encode="lores",
             )
             self.camera.configure(config) # type: ignore
